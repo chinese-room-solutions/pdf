@@ -113,7 +113,45 @@ func (p Page) Fonts() []string {
 
 // Font returns the font with the given name associated with the page.
 func (p Page) Font(name string) Font {
-	return Font{p.Resources().Key("Font").Key(name), nil}
+	fontDict := p.Resources().Key("Font").Key(name)
+	font := Font{V: fontDict, enc: nil}
+
+	if fontDict.Key("Subtype").Name() == "Type0" {
+		font.IsCIDFont = true
+		desc := fontDict.Key("DescendantFonts").Index(0)
+		font.DW = desc.Key("DW").Float64() // Default width
+		font.W = extractWidths(desc.Key("W"))
+	}
+
+	return font
+}
+
+func extractWidths(w Value) map[int]float64 {
+	widths := make(map[int]float64)
+
+	for i := 0; i < w.Len(); i++ {
+		firstCID := int(w.Index(i).Int64())
+		i++
+		next := w.Index(i)
+
+		if next.Kind() == Array {
+			// Case where an array follows the first CID, specifying individual widths
+			for j := 0; j < next.Len(); j++ {
+				widths[firstCID+j] = next.Index(j).Float64()
+			}
+		} else {
+			// Case where a single width is specified for a range of CIDs
+			lastCID := int(next.Int64())
+			i++
+			width := w.Index(i).Float64()
+
+			for cid := firstCID; cid <= lastCID; cid++ {
+				widths[cid] = width
+			}
+		}
+	}
+
+	return widths
 }
 
 // A Font represent a font in a PDF file.
@@ -121,6 +159,10 @@ func (p Page) Font(name string) Font {
 type Font struct {
 	V   Value
 	enc TextEncoding
+
+	IsCIDFont bool
+	DW        float64
+	W         map[int]float64
 }
 
 // BaseFont returns the font's name (BaseFont property).
@@ -151,6 +193,12 @@ func (f Font) Widths() []float64 {
 
 // Width returns the width of the given code point.
 func (f Font) Width(code int) float64 {
+	if f.IsCIDFont {
+		if width, ok := f.W[code]; ok {
+			return width
+		}
+		return f.DW
+	}
 	first := f.FirstChar()
 	last := f.LastChar()
 	if code < first || last < code {
@@ -791,10 +839,14 @@ func (p Page) Content() Content {
 	showText := func(s string) {
 		n := 0
 		decoded := enc.Decode(s)
+		utfSymbols := s
+		if isUTF16(s) {
+			utfSymbols = utf16Decode(s)
+		}
 		for _, ch := range decoded {
 			var w0 float64
-			if n < len(s) {
-				w0 = g.Tf.Width(int(s[n]))
+			if n < len(utfSymbols) {
+				w0 = g.Tf.Width(int(utfSymbols[n]))
 			}
 			n++
 
