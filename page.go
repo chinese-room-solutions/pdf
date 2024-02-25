@@ -17,6 +17,7 @@ import (
 // The methods interpret a Page dictionary stored in V.
 type Page struct {
 	V Value
+	F map[string]*Font
 }
 
 // Page returns the page for the given page number.
@@ -45,7 +46,7 @@ Search:
 			}
 			if kid.Key("Type").Name() == "Page" {
 				if num == 0 {
-					return Page{kid}
+					return Page{kid, getFonts(kid)}
 				}
 				num--
 			}
@@ -53,6 +54,34 @@ Search:
 		break
 	}
 	return Page{}
+}
+
+func getFonts(v Value) map[string]*Font {
+	fonts := make(map[string]*Font)
+
+	// get inherited resources associated with the page
+	for parent := v; !parent.IsNull(); parent = parent.Key("Parent") {
+		// get resources dictionary associated with the page
+		if resources := parent.Key("Resources"); !resources.IsNull() {
+			// get font dictionary associated with the page
+			font := resources.Key("Font")
+
+			for _, name := range font.Keys() {
+				fontDict := font.Key(name)
+				f := Font{V: fontDict, enc: nil}
+
+				if fontDict.Key("Subtype").Name() == "Type0" {
+					f.IsCIDFont = true
+					desc := fontDict.Key("DescendantFonts").Index(0)
+					f.DW = desc.Key("DW").Float64() // Default width
+					f.W = extractWidths(desc.Key("W"))
+				}
+				fonts[name] = &f
+			}
+		}
+	}
+
+	return fonts
 }
 
 // NumPage returns the number of pages in the PDF file.
@@ -64,16 +93,9 @@ func (r *Reader) NumPage() int {
 func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	pages := r.NumPage()
 	var buf bytes.Buffer
-	fonts := make(map[string]*Font)
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
-		for _, name := range p.Fonts() { // cache fonts so we don't continually parse charmap
-			if _, ok := fonts[name]; !ok {
-				f := p.Font(name)
-				fonts[name] = &f
-			}
-		}
-		text, err := p.GetPlainText(fonts)
+		text, err := p.GetPlainText()
 		if err != nil {
 			return &bytes.Buffer{}, err
 		}
@@ -82,48 +104,9 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	return &buf, nil
 }
 
-func (p Page) findInherited(key string) Value {
-	for v := p.V; !v.IsNull(); v = v.Key("Parent") {
-		if r := v.Key(key); !r.IsNull() {
-			return r
-		}
-	}
-	return Value{}
-}
-
-/*
-func (p Page) MediaBox() Value {
-	return p.findInherited("MediaBox")
-}
-
-func (p Page) CropBox() Value {
-	return p.findInherited("CropBox")
-}
-*/
-
-// Resources returns the resources dictionary associated with the page.
-func (p Page) Resources() Value {
-	return p.findInherited("Resources")
-}
-
-// Fonts returns a list of the fonts associated with the page.
-func (p Page) Fonts() []string {
-	return p.Resources().Key("Font").Keys()
-}
-
 // Font returns the font with the given name associated with the page.
-func (p Page) Font(name string) Font {
-	fontDict := p.Resources().Key("Font").Key(name)
-	font := Font{V: fontDict, enc: nil}
-
-	if fontDict.Key("Subtype").Name() == "Type0" {
-		font.IsCIDFont = true
-		desc := fontDict.Key("DescendantFonts").Index(0)
-		font.DW = desc.Key("DW").Float64() // Default width
-		font.W = extractWidths(desc.Key("W"))
-	}
-
-	return font
+func (p Page) Font(name string) *Font {
+	return p.F[name]
 }
 
 func extractWidths(w Value) map[int]float64 {
@@ -522,7 +505,7 @@ type gstate struct {
 	Tw    float64
 	Th    float64
 	Tl    float64
-	Tf    Font
+	Tf    *Font
 	Tfs   float64
 	Tmode int
 	Trise float64
@@ -534,7 +517,7 @@ type gstate struct {
 
 // GetPlainText returns the page's all text without format.
 // fonts can be passed in (to improve parsing performance) or left nil
-func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
+func (p Page) GetPlainText() (result string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = ""
@@ -544,14 +527,6 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
-
-	if fonts == nil {
-		fonts = make(map[string]*Font)
-		for _, font := range p.Fonts() {
-			f := p.Font(font)
-			fonts[font] = &f
-		}
-	}
 
 	var textBuilder bytes.Buffer
 	showText := func(s string) {
@@ -579,7 +554,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 			if len(args) != 2 {
 				panic("bad TL")
 			}
-			if font, ok := fonts[args[0].Name()]; ok {
+			if font, ok := p.F[args[0].Name()]; ok {
 				enc = font.Encoder()
 			} else {
 				enc = &nopEncoder{}
@@ -759,12 +734,6 @@ func (p Page) GetTextByRow() (Rows, error) {
 func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s string)) {
 	strm := p.V.Key("Contents")
 
-	fonts := make(map[string]*Font)
-	for _, font := range p.Fonts() {
-		f := p.Font(font)
-		fonts[font] = &f
-	}
-
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
 	Interpret(strm, func(stk *Stack, op string) {
@@ -787,7 +756,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 				panic("bad TL")
 			}
 
-			if font, ok := fonts[args[0].Name()]; ok {
+			if font, ok := p.F[args[0].Name()]; ok {
 				enc = font.Encoder()
 			} else {
 				enc = &nopEncoder{}
@@ -957,6 +926,12 @@ func (p Page) Content() Content {
 			}
 			f := args[0].Name()
 			g.Tf = p.Font(f)
+			if g.Tf == nil {
+				if DebugOn {
+					println("no font data for", f)
+				}
+				g.Tf = &Font{}
+			}
 			enc = g.Tf.Encoder()
 			if enc == nil {
 				if DebugOn {
