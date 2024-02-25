@@ -837,18 +837,14 @@ func (p Page) Content() Content {
 
 	var text []Text
 	showText := func(s string) {
-		n := 0
+		n := 1
 		decoded := enc.Decode(s)
-		utfSymbols := s
-		if isUTF16(s) {
-			utfSymbols = utf16Decode(s)
-		}
 		for _, ch := range decoded {
 			var w0 float64
-			if n < len(utfSymbols) {
-				w0 = g.Tf.Width(int(utfSymbols[n]))
+			if n < len(s) {
+				w0 = g.Tf.Width(int(s[n]))
 			}
-			n++
+			n += 2
 
 			f := g.Tf.BaseFont()
 			if i := strings.Index(f, "+"); i >= 0 {
