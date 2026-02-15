@@ -1,3 +1,3 @@
 module github.com/chinese-room-solutions/pdf
 
-go 1.21.6
+go 1.24.1

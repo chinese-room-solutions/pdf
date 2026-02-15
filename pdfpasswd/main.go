@@ -4,7 +4,7 @@
 
 // Pdfpasswd searches for the password for an encrypted PDF
 // by trying all strings over a given alphabet up to a given length.
-package main
+package main // import "rsc.io/pdf/pdfpasswd"
 
 import (
 	"flag"
@@ -72,7 +72,7 @@ func main() {
 		if err == pdf.ErrInvalidPassword {
 			log.Fatal("password not found")
 		}
-		log.Fatal("reading pdf: %v", err)
+		log.Fatalf("reading pdf: %v", err)
 	}
 	fmt.Printf("password: %q\n", last)
 }
