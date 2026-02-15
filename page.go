@@ -381,63 +381,118 @@ type cmap struct {
 	bfchar  []bfchar
 }
 
+func (m *cmap) lookupBfchar(code string) ([]rune, bool) {
+	n := len(code)
+	for _, bfchar := range m.bfchar {
+		if len(bfchar.orig) == n && bfchar.orig == code {
+			return []rune(utf16Decode(bfchar.repl)), true
+		}
+	}
+	return nil, false
+}
+
+func (m *cmap) lookupBfrange(code string) ([]rune, bool) {
+	n := len(code)
+	for _, bfrange := range m.bfrange {
+		if len(bfrange.lo) == n && bfrange.lo <= code && code <= bfrange.hi {
+			if bfrange.dst.Kind() == String {
+				s := bfrange.dst.RawString()
+				if bfrange.lo != code {
+					b := []byte(s)
+					b[len(b)-1] += code[len(code)-1] - bfrange.lo[len(bfrange.lo)-1]
+					s = string(b)
+				}
+				return []rune(utf16Decode(s)), true
+			}
+			if bfrange.dst.Kind() == Array {
+				idx := code[len(code)-1] - bfrange.lo[len(bfrange.lo)-1]
+				v := bfrange.dst.Index(int(idx))
+				if v.Kind() == String {
+					s := v.RawString()
+					return []rune(utf16Decode(s)), true
+				}
+				if DebugOn {
+					fmt.Printf("array %v\n", bfrange.dst)
+				}
+			} else {
+				if DebugOn {
+					fmt.Printf("unknown dst %v\n", bfrange.dst)
+				}
+			}
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
 func (m *cmap) Decode(raw string) (text string) {
 	var r []rune
-Parse:
 	for len(raw) > 0 {
-		for n := 1; n <= 4 && n <= len(raw); n++ { // number of digits in character replacement (1-4 possible)
-			for _, space := range m.space[n-1] { // find matching codespace Ranges for number of digits
-				if space.low <= raw[:n] && raw[:n] <= space.high { // see if value is in range
-					text := raw[:n]
-					raw = raw[n:]
-					for _, bfchar := range m.bfchar { // check for matching bfchar
-						if len(bfchar.orig) == n && bfchar.orig == text {
-							r = append(r, []rune(utf16Decode(bfchar.repl))...)
-							continue Parse
-						}
+		var decoded []rune
+		var fallbackN int // shortest codespace match (for unmapped codes)
+		var consumeN int  // bytes to consume for the best match found
+
+		// Try each byte length, preferring the one that finds a mapping.
+		// Don't commit to a codespace match that has no mapping if a longer
+		// match might succeed.
+		for n := 1; n <= 4 && n <= len(raw); n++ {
+			for _, space := range m.space[n-1] {
+				if space.low <= raw[:n] && raw[:n] <= space.high {
+					if fallbackN == 0 {
+						fallbackN = n
 					}
-					for _, bfrange := range m.bfrange { // check for matching bfrange
-						if len(bfrange.lo) == n && bfrange.lo <= text && text <= bfrange.hi {
-							if bfrange.dst.Kind() == String {
-								s := bfrange.dst.RawString()
-								if bfrange.lo != text { // value isn't at the beginning of the range so scale result
-									b := []byte(s)
-									b[len(b)-1] += text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1] // increment last byte by difference
-									s = string(b)
-								}
-								r = append(r, []rune(utf16Decode(s))...)
-								continue Parse
-							}
-							if bfrange.dst.Kind() == Array {
-								n := text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1]
-								v := bfrange.dst.Index(int(n))
-								if v.Kind() == String {
-									s := v.RawString()
-									r = append(r, []rune(utf16Decode(s))...)
-									continue Parse
-								}
-								if DebugOn {
-									fmt.Printf("array %v\n", bfrange.dst)
-								}
-							} else {
-								if DebugOn {
-									fmt.Printf("unknown dst %v\n", bfrange.dst)
-								}
-							}
-							r = append(r, noRune)
-							continue Parse
-						}
+					code := raw[:n]
+					if d, ok := m.lookupBfchar(code); ok {
+						decoded = d
+						consumeN = n
+					} else if d, ok := m.lookupBfrange(code); ok {
+						decoded = d
+						consumeN = n
 					}
-					r = append(r, noRune)
-					continue Parse
+					break
+				}
+			}
+			if decoded != nil {
+				break
+			}
+		}
+
+		// If no codespace-based lookup worked, try a direct bfchar/bfrange
+		// lookup without requiring a codespace match. This handles CMaps
+		// with bfchar entries whose keys fall outside declared codespace
+		// ranges (common in Identity-H CID fonts).
+		if decoded == nil {
+			for n := 4; n >= 1; n-- {
+				if n > len(raw) {
+					continue
+				}
+				code := raw[:n]
+				if d, ok := m.lookupBfchar(code); ok {
+					decoded = d
+					consumeN = n
+					break
+				}
+				if d, ok := m.lookupBfrange(code); ok {
+					decoded = d
+					consumeN = n
+					break
 				}
 			}
 		}
-		if DebugOn {
-			println("no code space found")
+
+		if decoded != nil {
+			r = append(r, decoded...)
+			raw = raw[consumeN:]
+		} else if fallbackN > 0 {
+			r = append(r, noRune)
+			raw = raw[fallbackN:]
+		} else {
+			if DebugOn {
+				println("no code space found")
+			}
+			r = append(r, noRune)
+			raw = raw[1:]
 		}
-		r = append(r, noRune)
-		raw = raw[1:]
 	}
 	return string(r)
 }
