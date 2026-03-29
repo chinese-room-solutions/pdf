@@ -418,7 +418,7 @@ func (b *buffer) readObject() object {
 			return b.readDict()
 		case "[":
 			return b.readArray()
-		case ">>":
+		case ">>", "]":
 			// stop the object
 			return nil
 		}
@@ -466,7 +466,7 @@ func (b *buffer) readArray() object {
 	var x array
 	for {
 		tok := b.readToken()
-		if tok == nil || tok == keyword("]") {
+		if tok == nil || tok == io.EOF || tok == keyword("]") {
 			break
 		}
 		b.unreadToken(tok)
