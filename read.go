@@ -62,6 +62,7 @@ package pdf
 
 import (
 	"bytes"
+	"compress/lzw"
 	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
@@ -851,6 +852,32 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			panic("pred")
 		case 12:
 			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
+		}
+	case "LZWDecode":
+		// PDF uses LZW with MSB bit ordering and 8-bit literal width.
+		// Many older PDFs produce streams that end without a proper EOD marker,
+		// causing "lzw: invalid code" errors. We buffer the decoded data and
+		// tolerate these trailing errors as long as some data was decoded.
+		lzwReader := lzw.NewReader(rd, lzw.MSB, 8)
+		decoded, err := ioutil.ReadAll(lzwReader)
+		lzwReader.Close()
+		if err != nil && len(decoded) == 0 {
+			panic(err)
+		}
+		var result io.Reader = bytes.NewReader(decoded)
+		pred := param.Key("Predictor")
+		if pred.Kind() == Null {
+			return result
+		}
+		columns := param.Key("Columns").Int64()
+		switch pred.Int64() {
+		default:
+			if DebugOn {
+				fmt.Println("unknown predictor", pred)
+			}
+			panic("pred")
+		case 12:
+			return &pngUpReader{r: result, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
 		}
 	case "ASCII85Decode":
 		cleanASCII85 := newAlphaReader(rd)
