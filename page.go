@@ -610,10 +610,11 @@ type Point struct {
 	Y float64
 }
 
-// Content describes the basic content on a page: the text and any drawn rectangles.
+// Content describes the basic content on a page: the text, any drawn rectangles, and extracted images.
 type Content struct {
-	Text []Text
-	Rect []Rect
+	Text   []Text
+	Rect   []Rect
+	Images []ExtractedImage
 }
 
 type gstate struct {
@@ -633,21 +634,30 @@ type gstate struct {
 
 // GetPlainText returns the page's all text without format.
 func (p Page) GetPlainText() (result string, err error) {
+	text, _, err := p.GetPlainTextWithImages()
+	return text, err
+}
+
+// GetPlainTextWithImages returns the page's text with [IMAGE_N] markers
+// inserted where images appear in the content stream, plus the extracted images.
+func (p Page) GetPlainTextWithImages() (result string, images []ExtractedImage, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = ""
+			images = nil
 			err = errors.New(fmt.Sprint(r))
 		}
 	}()
 
 	// Handle in case the content page is empty
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
-		return "", nil
+		return "", nil, nil
 	}
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
 
 	var textBuilder bytes.Buffer
+	imageIndex := 0
 	showText := func(s string) {
 		textBuilder.WriteString(s)
 	}
@@ -669,9 +679,32 @@ func (p Page) GetPlainText() (result string, err error) {
 
 		switch op {
 		default:
-			// Easier debug
-			// fmt.Println("<DEBUG><op>", op, "</op><args>", args, "</args>")
 			return
+		case "Do": // invoke named XObject — extract images
+			if len(args) < 1 {
+				return
+			}
+			name := args[0].Name()
+			xobj := p.Resources().Key("XObject").Key(name)
+			if xobj.IsNull() {
+				return
+			}
+			if xobj.Key("Subtype").Name() != "Image" {
+				return
+			}
+			imageIndex++
+			img, extractErr := extractImage(xobj)
+			if extractErr != nil {
+				if DebugOn {
+					fmt.Println("image extraction failed:", name, extractErr)
+				}
+				// Still insert marker even if extraction fails.
+				showText(fmt.Sprintf("[IMAGE_%d]", imageIndex))
+				return
+			}
+			img.Index = imageIndex
+			images = append(images, *img)
+			showText(fmt.Sprintf("[IMAGE_%d]", imageIndex))
 		case "BT": // add a space between text objects
 			showText("\n")
 		case "T*": // move to start of next line
@@ -710,7 +743,7 @@ func (p Page) GetPlainText() (result string, err error) {
 			}
 		}
 	})
-	return textBuilder.String(), nil
+	return textBuilder.String(), images, nil
 }
 
 // Column represents the contents of a column
@@ -965,6 +998,8 @@ func (p Page) Content() Content {
 	}
 
 	var rect []Rect
+	var images []ExtractedImage
+	imageIndex := 0
 	var gstack []gstate
 	Interpret(strm, func(stk *Stack, op string) {
 		n := stk.Len()
@@ -978,6 +1013,30 @@ func (p Page) Content() Content {
 			// 	fmt.Println(op, args)
 			// }
 			return
+
+		case "Do": // invoke named XObject
+			if len(args) < 1 {
+				return
+			}
+			name := args[0].Name()
+			xobj := p.Resources().Key("XObject").Key(name)
+			if xobj.IsNull() {
+				return
+			}
+			subtype := xobj.Key("Subtype").Name()
+			if subtype != "Image" {
+				return
+			}
+			imageIndex++
+			img, err := extractImage(xobj)
+			if err != nil {
+				if DebugOn {
+					fmt.Println("image extraction failed:", name, err)
+				}
+				return
+			}
+			img.Index = imageIndex
+			images = append(images, *img)
 
 		case "cm": // update g.CTM
 			if len(args) != 6 {
@@ -1154,7 +1213,7 @@ func (p Page) Content() Content {
 			g.Th = args[0].Float64() / 100
 		}
 	})
-	return Content{text, rect}
+	return Content{text, rect, images}
 }
 
 // TextVertical implements sort.Interface for sorting

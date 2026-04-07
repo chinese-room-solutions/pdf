@@ -834,6 +834,10 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 	switch name {
 	default:
 		panic("unknown filter " + name)
+	case "DCTDecode": // JPEG — raw bytes are the image, no decompression needed.
+		return rd
+	case "JPXDecode": // JPEG 2000 — pass through raw bytes.
+		return rd
 	case "FlateDecode":
 		zr, err := zlib.NewReader(rd)
 		if err != nil {
