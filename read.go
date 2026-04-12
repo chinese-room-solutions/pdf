@@ -838,6 +838,12 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 		return rd
 	case "JPXDecode": // JPEG 2000 — pass through raw bytes.
 		return rd
+	case "CCITTFaxDecode": // Fax-encoded monochrome image. No decoder here; pass through so callers that don't need pixel data (e.g. text extraction) can proceed.
+		return rd
+	case "JBIG2Decode": // JBIG2 monochrome image. Same rationale — pass through.
+		return rd
+	case "RunLengthDecode":
+		return newRunLengthReader(rd)
 	case "FlateDecode":
 		zr, err := zlib.NewReader(rd)
 		if err != nil {
@@ -848,14 +854,31 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			return zr
 		}
 		columns := param.Key("Columns").Int64()
-		switch pred.Int64() {
+		colors := param.Key("Colors").Int64()
+		if colors == 0 {
+			colors = 1
+		}
+		bpc := param.Key("BitsPerComponent").Int64()
+		if bpc == 0 {
+			bpc = 8
+		}
+		switch p := pred.Int64(); {
+		case p == 1:
+			// No predictor.
+			return zr
+		case p == 2:
+			// TIFF predictor — not common with Flate; pass through.
+			return zr
+		case p == 12:
+			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
+		case p >= 10 && p <= 15:
+			// PNG predictor (any filter, incl. Optimal=15).
+			return newPngPredictorReader(zr, int(colors), int(bpc), int(columns))
 		default:
 			if DebugOn {
 				fmt.Println("unknown predictor", pred)
 			}
 			panic("pred")
-		case 12:
-			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
 		}
 	case "LZWDecode":
 		// PDF uses LZW with MSB bit ordering and 8-bit literal width.
@@ -874,14 +897,26 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			return result
 		}
 		columns := param.Key("Columns").Int64()
-		switch pred.Int64() {
+		colors := param.Key("Colors").Int64()
+		if colors == 0 {
+			colors = 1
+		}
+		bpc := param.Key("BitsPerComponent").Int64()
+		if bpc == 0 {
+			bpc = 8
+		}
+		switch p := pred.Int64(); {
+		case p == 1, p == 2:
+			return result
+		case p == 12:
+			return &pngUpReader{r: result, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
+		case p >= 10 && p <= 15:
+			return newPngPredictorReader(result, int(colors), int(bpc), int(columns))
 		default:
 			if DebugOn {
 				fmt.Println("unknown predictor", pred)
 			}
 			panic("pred")
-		case 12:
-			return &pngUpReader{r: result, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
 		}
 	case "ASCII85Decode":
 		cleanASCII85 := newAlphaReader(rd)
@@ -897,6 +932,59 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			return decoder
 		}
 	}
+}
+
+// runLengthReader decodes PDF RunLengthDecode streams (PDF 32000-1:2008 §7.4.5).
+// Each byte is a length code: 0..127 means copy next n+1 bytes verbatim;
+// 129..255 means repeat the next byte 257-n times; 128 is EOD.
+type runLengthReader struct {
+	r    io.Reader
+	buf  []byte
+	done bool
+}
+
+func newRunLengthReader(r io.Reader) *runLengthReader { return &runLengthReader{r: r} }
+
+func (r *runLengthReader) Read(p []byte) (int, error) {
+	n := 0
+	for len(p) > 0 {
+		if len(r.buf) > 0 {
+			m := copy(p, r.buf)
+			n += m
+			p = p[m:]
+			r.buf = r.buf[m:]
+			continue
+		}
+		if r.done {
+			return n, io.EOF
+		}
+		var head [1]byte
+		if _, err := io.ReadFull(r.r, head[:]); err != nil {
+			return n, err
+		}
+		length := int(head[0])
+		switch {
+		case length < 128:
+			tmp := make([]byte, length+1)
+			if _, err := io.ReadFull(r.r, tmp); err != nil {
+				return n, err
+			}
+			r.buf = tmp
+		case length > 128:
+			var b [1]byte
+			if _, err := io.ReadFull(r.r, b[:]); err != nil {
+				return n, err
+			}
+			tmp := make([]byte, 257-length)
+			for i := range tmp {
+				tmp[i] = b[0]
+			}
+			r.buf = tmp
+		default: // 128 — EOD
+			r.done = true
+		}
+	}
+	return n, nil
 }
 
 type pngUpReader struct {
@@ -927,6 +1015,131 @@ func (r *pngUpReader) Read(b []byte) (int, error) {
 			r.hist[i] += b
 		}
 		r.pend = r.hist[1:]
+	}
+	return n, nil
+}
+
+// pngPredictorReader implements the general PNG filtering algorithm used
+// by PDF Predictor values 10–15. The first byte of every row selects the
+// filter type (None/Sub/Up/Average/Paeth) and the remaining "columns * bpp"
+// bytes are the filtered data. Predictor 15 ("Optimal") means the encoder
+// can pick any row-level filter, so we must support all of them.
+type pngPredictorReader struct {
+	r       io.Reader
+	colors  int // components per pixel
+	bpc     int // bits per component
+	columns int // columns per row
+	bpp     int // bytes per pixel (max(1, ceil(colors*bpc/8)))
+	rowSize int // bytes in a decoded row (ceil(columns*colors*bpc/8))
+	prev    []byte
+	cur     []byte
+	tmp     []byte
+	pend    []byte
+}
+
+func newPngPredictorReader(r io.Reader, colors, bpc, columns int) *pngPredictorReader {
+	if colors <= 0 {
+		colors = 1
+	}
+	if bpc <= 0 {
+		bpc = 8
+	}
+	bpp := (colors*bpc + 7) / 8
+	if bpp < 1 {
+		bpp = 1
+	}
+	rowSize := (columns*colors*bpc + 7) / 8
+	return &pngPredictorReader{
+		r:       r,
+		colors:  colors,
+		bpc:     bpc,
+		columns: columns,
+		bpp:     bpp,
+		rowSize: rowSize,
+		prev:    make([]byte, rowSize),
+		cur:     make([]byte, rowSize),
+		tmp:     make([]byte, 1+rowSize),
+	}
+}
+
+func paethPredictor(a, b, c byte) byte {
+	p := int(a) + int(b) - int(c)
+	pa := p - int(a)
+	if pa < 0 {
+		pa = -pa
+	}
+	pb := p - int(b)
+	if pb < 0 {
+		pb = -pb
+	}
+	pc := p - int(c)
+	if pc < 0 {
+		pc = -pc
+	}
+	switch {
+	case pa <= pb && pa <= pc:
+		return a
+	case pb <= pc:
+		return b
+	default:
+		return c
+	}
+}
+
+func (r *pngPredictorReader) Read(b []byte) (int, error) {
+	n := 0
+	for len(b) > 0 {
+		if len(r.pend) > 0 {
+			m := copy(b, r.pend)
+			n += m
+			b = b[m:]
+			r.pend = r.pend[m:]
+			continue
+		}
+		_, err := io.ReadFull(r.r, r.tmp)
+		if err != nil {
+			return n, err
+		}
+		filter := r.tmp[0]
+		row := r.tmp[1:]
+		switch filter {
+		case 0: // None
+			copy(r.cur, row)
+		case 1: // Sub
+			for i := 0; i < r.rowSize; i++ {
+				var left byte
+				if i >= r.bpp {
+					left = r.cur[i-r.bpp]
+				}
+				r.cur[i] = row[i] + left
+			}
+		case 2: // Up
+			for i := 0; i < r.rowSize; i++ {
+				r.cur[i] = row[i] + r.prev[i]
+			}
+		case 3: // Average
+			for i := 0; i < r.rowSize; i++ {
+				var left byte
+				if i >= r.bpp {
+					left = r.cur[i-r.bpp]
+				}
+				r.cur[i] = row[i] + byte((int(left)+int(r.prev[i]))/2)
+			}
+		case 4: // Paeth
+			for i := 0; i < r.rowSize; i++ {
+				var left, upLeft byte
+				if i >= r.bpp {
+					left = r.cur[i-r.bpp]
+					upLeft = r.prev[i-r.bpp]
+				}
+				r.cur[i] = row[i] + paethPredictor(left, r.prev[i], upLeft)
+			}
+		default:
+			return n, fmt.Errorf("unsupported PNG predictor filter %d", filter)
+		}
+		// Swap cur/prev: cur becomes prev for next row.
+		r.prev, r.cur = r.cur, r.prev
+		r.pend = r.prev
 	}
 	return n, nil
 }
