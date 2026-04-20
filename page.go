@@ -260,6 +260,16 @@ func (f Font) Encoder() TextEncoding {
 }
 
 func (f Font) getEncoder() TextEncoding {
+	// If the font has a ToUnicode CMap, prefer it — it is always the most
+	// accurate source. Encoding dicts with /Differences arrays only map a
+	// subset of codes (the rest fall through as raw bytes, producing
+	// control characters in output), and the PDF spec designates
+	// ToUnicode as the authoritative glyph-to-Unicode mapping.
+	if tu := f.V.Key("ToUnicode"); tu.Kind() == Stream {
+		if m := readCmap(tu); m != nil {
+			return m
+		}
+	}
 	enc := f.V.Key("Encoding")
 	switch enc.Kind() {
 	case Name:
@@ -268,8 +278,11 @@ func (f Font) getEncoder() TextEncoding {
 			return &byteEncoder{&winAnsiEncoding}
 		case "MacRomanEncoding":
 			return &byteEncoder{&macRomanEncoding}
-		case "Identity-H":
-			return f.charmapEncoding()
+		case "Identity-H", "Identity-V":
+			// Identity encodings use 2-byte codes. Without a ToUnicode
+			// CMap we have no way to map to Unicode — emit replacement
+			// chars rather than leaking raw bytes.
+			return &identityCIDEncoder{}
 		default:
 			if DebugOn {
 				println("unknown encoding", enc.Name())
@@ -299,6 +312,21 @@ func (f *Font) charmapEncoding() TextEncoding {
 	}
 
 	return &byteEncoder{&pdfDocEncoding}
+}
+
+// identityCIDEncoder handles Identity-H/V CID fonts that lack a ToUnicode
+// CMap. Without the mapping we can't produce real Unicode, so each 2-byte
+// CID becomes a single replacement character — this keeps output length
+// proportional to glyph count and avoids emitting raw binary bytes.
+type identityCIDEncoder struct{}
+
+func (e *identityCIDEncoder) Decode(raw string) string {
+	n := (len(raw) + 1) / 2
+	out := make([]rune, n)
+	for i := range out {
+		out[i] = noRune
+	}
+	return string(out)
 }
 
 type dictEncoder struct {
@@ -974,6 +1002,9 @@ func (p Page) Content() Content {
 
 	var text []Text
 	showText := func(s string) {
+		if g.Tf == nil {
+			return
+		}
 		n := 1
 		decoded := enc.Decode(s)
 		for _, ch := range decoded {
@@ -1001,7 +1032,27 @@ func (p Page) Content() Content {
 	var images []ExtractedImage
 	imageIndex := 0
 	var gstack []gstate
-	Interpret(strm, func(stk *Stack, op string) {
+
+	// currentRes tracks the active Resources dict, which changes when we
+	// recurse into Form XObjects. Font and XObject lookups must resolve
+	// against this rather than the page's resources.
+	resStack := []Value{p.Resources()}
+	getRes := func() Value { return resStack[len(resStack)-1] }
+	resolveFont := func(name string) *Font {
+		fv := getRes().Key("Font").Key(name)
+		if fv.Kind() == Null {
+			return nil
+		}
+		f := Font{V: fv}
+		return &f
+	}
+
+	// xobjDepth guards against runaway recursion in malformed PDFs where
+	// Form XObjects reference each other in a cycle.
+	xobjDepth := 0
+	var interpret func(stream Value)
+	interpret = func(stream Value) {
+		Interpret(stream, func(stk *Stack, op string) {
 		n := stk.Len()
 		args := make([]Value, n)
 		for i := n - 1; i >= 0; i-- {
@@ -1019,24 +1070,49 @@ func (p Page) Content() Content {
 				return
 			}
 			name := args[0].Name()
-			xobj := p.Resources().Key("XObject").Key(name)
+			xobj := getRes().Key("XObject").Key(name)
 			if xobj.IsNull() {
 				return
 			}
-			subtype := xobj.Key("Subtype").Name()
-			if subtype != "Image" {
-				return
-			}
-			imageIndex++
-			img, err := extractImage(xobj)
-			if err != nil {
-				if DebugOn {
-					fmt.Println("image extraction failed:", name, err)
+			switch xobj.Key("Subtype").Name() {
+			case "Image":
+				imageIndex++
+				img, err := extractImage(xobj)
+				if err != nil {
+					if DebugOn {
+						fmt.Println("image extraction failed:", name, err)
+					}
+					return
 				}
-				return
+				img.Index = imageIndex
+				images = append(images, *img)
+			case "Form":
+				if xobjDepth >= 8 {
+					return
+				}
+				// Per PDF spec 8.10: executing a Form XObject is
+				// bracketed by an implicit q/Q — save/restore graphics
+				// state — and its own Matrix is concatenated to CTM.
+				saved := g
+				if m := xobj.Key("Matrix"); m.Kind() == Array && m.Len() == 6 {
+					var formMatrix matrix
+					for i := 0; i < 6; i++ {
+						formMatrix[i/2][i%2] = m.Index(i).Float64()
+					}
+					formMatrix[2][2] = 1
+					g.CTM = formMatrix.mul(g.CTM)
+				}
+				subRes := xobj.Key("Resources")
+				if subRes.Kind() == Null {
+					subRes = getRes()
+				}
+				resStack = append(resStack, subRes)
+				xobjDepth++
+				interpret(xobj)
+				xobjDepth--
+				resStack = resStack[:len(resStack)-1]
+				g = saved
 			}
-			img.Index = imageIndex
-			images = append(images, *img)
 
 		case "cm": // update g.CTM
 			if len(args) != 6 {
@@ -1119,7 +1195,7 @@ func (p Page) Content() Content {
 				panic("bad TL")
 			}
 			f := args[0].Name()
-			g.Tf = p.Font(f)
+			g.Tf = resolveFont(f)
 			if g.Tf == nil {
 				if DebugOn {
 					println("no font data for", f)
@@ -1211,7 +1287,10 @@ func (p Page) Content() Content {
 			}
 			g.Th = args[0].Float64() / 100
 		}
-	})
+		})
+	}
+
+	interpret(strm)
 	return Content{text, rect, images}
 }
 

@@ -240,8 +240,10 @@ Loop:
 		case '\\':
 			switch c = b.readByte(); c {
 			default:
-				b.errorf("invalid escape sequence \\%c", c)
-				tmp = append(tmp, '\\', c)
+				// Per PDF spec 7.3.4.2: unrecognized escape sequences
+				// should be ignored (the backslash is dropped, the
+				// following character is preserved).
+				tmp = append(tmp, c)
 			case 'n':
 				tmp = append(tmp, '\n')
 			case 'r':

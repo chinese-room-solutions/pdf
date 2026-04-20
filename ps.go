@@ -140,12 +140,63 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 					stk.Push(v)
 					stk.Push(v)
 					continue
+				case "BI":
+					// Inline image: consume the dict tokens until "ID",
+					// then skip raw image bytes until "EI". Per PDF spec
+					// 8.9.7, the bytes between ID and EI must not be
+					// tokenized as PDF syntax.
+					skipInlineImage(b)
+					continue
 				}
 			}
 			b.unreadToken(tok)
 			obj := b.readObject()
 			stk.Push(Value{nil, objptr{}, obj})
 		}
+	}
+}
+
+// skipInlineImage consumes an inline image: the key/value pairs between
+// BI and ID (already tokenized), followed by the raw image bytes terminated
+// by "EI" surrounded by whitespace. The data between ID and EI must not be
+// tokenized as PDF syntax — it is arbitrary binary.
+func skipInlineImage(b *buffer) {
+	// Consume tokens until the "ID" keyword marks end of the dict.
+	for {
+		tok := b.readToken()
+		if tok == io.EOF {
+			return
+		}
+		if kw, ok := tok.(keyword); ok && kw == "ID" {
+			break
+		}
+	}
+	// After "ID" there is exactly one whitespace byte before the image data.
+	c := b.readByte()
+	if c != ' ' && c != '\t' && c != '\r' && c != '\n' {
+		b.unreadByte()
+	} else if c == '\r' {
+		if n := b.readByte(); n != '\n' {
+			b.unreadByte()
+		}
+	}
+	// Scan byte-by-byte for whitespace-EI-whitespace. This sliding window
+	// matches the PDF spec: "EI" is a keyword so it must be delimited.
+	var prev byte = ' '
+	for !b.eof {
+		c := b.readByte()
+		if isSpace(prev) && c == 'E' {
+			if n := b.readByte(); n == 'I' {
+				if nn := b.readByte(); isSpace(nn) || isDelim(nn) {
+					b.unreadByte()
+					return
+				}
+				b.unreadByte()
+			} else {
+				b.unreadByte()
+			}
+		}
+		prev = c
 	}
 }
 
