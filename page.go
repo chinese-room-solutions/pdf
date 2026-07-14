@@ -275,6 +275,7 @@ func (f Font) getEncoder() TextEncoding {
 	if tu := f.V.Key("ToUnicode"); tu.Kind() == Stream {
 		if m := readCmap(tu); m != nil {
 			m.fallback = f.encodingEncoder()
+			m.simple = !f.IsCIDFont
 			return m
 		}
 	}
@@ -414,6 +415,39 @@ type cmap struct {
 	// codes; the rest must still go through the font's /Encoding rather
 	// than turn into replacement characters.
 	fallback TextEncoding
+
+	// simple marks a non-composite font, whose codes are 1 byte by spec
+	// no matter what the CMap's codespace claims — Distiller stubs declare
+	// <0000><FFFF> on simple fonts, and honoring that would pair up bytes
+	// and eat two characters per failed lookup.
+	simple bool
+}
+
+// decodeSimple decodes a simple font's string one 1-byte code at a time.
+// CMap entries are keyed either by the raw byte or its 0-padded 2-byte form
+// (both appear in the wild, sometimes in the same CMap); codes the CMap
+// doesn't map fall back to the /Encoding-derived encoder.
+func (m *cmap) decodeSimple(raw string) string {
+	var r []rune
+	for i := 0; i < len(raw); i++ {
+		found := false
+		for _, code := range []string{raw[i : i+1], string([]byte{0, raw[i]})} {
+			if d, ok := m.lookupBfchar(code); ok {
+				r = append(r, d...)
+				found = true
+				break
+			}
+			if d, ok := m.lookupBfrange(code); ok {
+				r = append(r, d...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			r = append(r, m.unmapped(raw[i:i+1])...)
+		}
+	}
+	return string(r)
 }
 
 // unmapped decodes a code the CMap has no bfchar/bfrange entry for. Only
@@ -471,6 +505,9 @@ func (m *cmap) lookupBfrange(code string) ([]rune, bool) {
 }
 
 func (m *cmap) Decode(raw string) (text string) {
+	if m.simple {
+		return m.decodeSimple(raw)
+	}
 	var r []rune
 	for len(raw) > 0 {
 		var decoded []rune

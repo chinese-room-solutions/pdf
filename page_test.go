@@ -194,3 +194,44 @@ end end`
 		t.Errorf("got %q, want %q", got.String(), "ZB")
 	}
 }
+
+// TestToUnicodeSimpleFontIgnoresCodespace: Distiller stubs declare a 2-byte
+// <0000><FFFF> codespace on simple fonts whose codes are 1 byte by spec.
+// Honoring the codespace pairs bytes up and eats two characters per failed
+// lookup. Simple-font decoding must walk byte-wise, accept both raw and
+// 0-padded CMap keys, and fall back to /Encoding per code.
+func TestToUnicodeSimpleFontIgnoresCodespace(t *testing.T) {
+	cmapStream := `/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CMapType 2 def
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+2 beginbfchar
+<41> <005a>
+<0042> <0059>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end end`
+	data := buildFontPDF(t,
+		[]string{
+			"<< /Type /Font /Subtype /Type1 /BaseFont /Garamond /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 67 /Widths [700 700 700] /ToUnicode 5 0 R >>",
+			fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(cmapStream), cmapStream),
+		},
+		"BT /F1 10 Tf 100 700 Td (ABC) Tj ET\n")
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	var got strings.Builder
+	for _, tx := range r.Page(1).Content().Text {
+		got.WriteString(tx.S)
+	}
+	// 'A' matches the raw 1-byte key, 'B' the 0-padded 2-byte key, and 'C'
+	// is unmapped — it must survive via WinAnsi, not vanish into U+FFFD.
+	if got.String() != "ZYC" {
+		t.Errorf("got %q, want %q", got.String(), "ZYC")
+	}
+}
