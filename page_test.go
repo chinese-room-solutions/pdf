@@ -155,3 +155,42 @@ func TestCIDFontWidths(t *testing.T) {
 		[]float64{7.0, 7.1, 5.0},
 		[]float64{100, 107, 114.1})
 }
+
+// TestToUnicodeStubFallback: a ToUnicode CMap only covers the codes it maps.
+// Word/Ghostscript emit stub CMaps mapping a handful of codes; the rest must
+// fall back per-code to the /Encoding-derived encoder instead of decoding to
+// U+FFFD (which downstream cleanup strips, silently deleting page text).
+func TestToUnicodeStubFallback(t *testing.T) {
+	cmapStream := `/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CMapType 2 def
+1 begincodespacerange
+<00><ff>
+endcodespacerange
+1 beginbfrange
+<41><41><005a>
+endbfrange
+endcmap
+CMapName currentdict /CMap defineresource pop
+end end`
+	data := buildFontPDF(t,
+		[]string{
+			"<< /Type /Font /Subtype /TrueType /BaseFont /Arial /Encoding /WinAnsiEncoding /FirstChar 65 /LastChar 66 /Widths [700 700] /ToUnicode 5 0 R >>",
+			fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(cmapStream), cmapStream),
+		},
+		"BT /F1 10 Tf 100 700 Td (AB) Tj ET\n")
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	var got strings.Builder
+	for _, tx := range r.Page(1).Content().Text {
+		got.WriteString(tx.S)
+	}
+	// 'A' (0x41) goes through the CMap's bfrange (→ 'Z'); 'B' (0x42) is
+	// unmapped there and must fall back to WinAnsi.
+	if got.String() != "ZB" {
+		t.Errorf("got %q, want %q", got.String(), "ZB")
+	}
+}

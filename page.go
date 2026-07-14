@@ -268,16 +268,22 @@ func (f Font) Encoder() TextEncoding {
 }
 
 func (f Font) getEncoder() TextEncoding {
-	// If the font has a ToUnicode CMap, prefer it — it is always the most
-	// accurate source. Encoding dicts with /Differences arrays only map a
-	// subset of codes (the rest fall through as raw bytes, producing
-	// control characters in output), and the PDF spec designates
-	// ToUnicode as the authoritative glyph-to-Unicode mapping.
+	// A ToUnicode CMap is the authoritative glyph-to-Unicode mapping, but
+	// only for the codes it actually maps: Word/Ghostscript emit stub CMaps
+	// covering a handful of codes, so codes it misses fall back per-code to
+	// the /Encoding-derived encoder rather than becoming replacement chars.
 	if tu := f.V.Key("ToUnicode"); tu.Kind() == Stream {
 		if m := readCmap(tu); m != nil {
+			m.fallback = f.encodingEncoder()
 			return m
 		}
 	}
+	return f.encodingEncoder()
+}
+
+// encodingEncoder resolves the encoder from the font's /Encoding entry alone,
+// ignoring any ToUnicode CMap.
+func (f Font) encodingEncoder() TextEncoding {
 	enc := f.V.Key("Encoding")
 	switch enc.Kind() {
 	case Name:
@@ -300,26 +306,13 @@ func (f Font) getEncoder() TextEncoding {
 	case Dict:
 		return &dictEncoder{enc.Key("Differences")}
 	case Null:
-		return f.charmapEncoding()
+		return &byteEncoder{&pdfDocEncoding}
 	default:
 		if DebugOn {
 			println("unexpected encoding", enc.String())
 		}
 		return &nopEncoder{}
 	}
-}
-
-func (f *Font) charmapEncoding() TextEncoding {
-	toUnicode := f.V.Key("ToUnicode")
-	if toUnicode.Kind() == Stream {
-		m := readCmap(toUnicode)
-		if m == nil {
-			return &nopEncoder{}
-		}
-		return m
-	}
-
-	return &byteEncoder{&pdfDocEncoding}
 }
 
 // identityCIDEncoder handles Identity-H/V CID fonts that lack a ToUnicode
@@ -415,6 +408,22 @@ type cmap struct {
 	space   [4][]byteRange // codespace range
 	bfrange []bfrange
 	bfchar  []bfchar
+
+	// fallback decodes single-byte codes the CMap itself doesn't map.
+	// Word/Ghostscript emit stub ToUnicode CMaps covering a handful of
+	// codes; the rest must still go through the font's /Encoding rather
+	// than turn into replacement characters.
+	fallback TextEncoding
+}
+
+// unmapped decodes a code the CMap has no bfchar/bfrange entry for. Only
+// single-byte codes can be delegated — a byte-oriented fallback would decode
+// the halves of a multi-byte CID as two unrelated characters.
+func (m *cmap) unmapped(code string) []rune {
+	if m.fallback != nil && len(code) == 1 {
+		return []rune(m.fallback.Decode(code))
+	}
+	return []rune{noRune}
 }
 
 func (m *cmap) lookupBfchar(code string) ([]rune, bool) {
@@ -520,13 +529,13 @@ func (m *cmap) Decode(raw string) (text string) {
 			r = append(r, decoded...)
 			raw = raw[consumeN:]
 		} else if fallbackN > 0 {
-			r = append(r, noRune)
+			r = append(r, m.unmapped(raw[:fallbackN])...)
 			raw = raw[fallbackN:]
 		} else {
 			if DebugOn {
 				println("no code space found")
 			}
-			r = append(r, noRune)
+			r = append(r, m.unmapped(raw[:1])...)
 			raw = raw[1:]
 		}
 	}
