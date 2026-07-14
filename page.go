@@ -67,21 +67,29 @@ func getFonts(v Value) map[string]*Font {
 			font := resources.Key("Font")
 
 			for _, name := range font.Keys() {
-				fontDict := font.Key(name)
-				f := Font{V: fontDict, enc: nil}
-
-				if fontDict.Key("Subtype").Name() == "Type0" {
-					f.IsCIDFont = true
-					desc := fontDict.Key("DescendantFonts").Index(0)
-					f.DW = desc.Key("DW").Float64() // Default width
-					f.W = extractWidths(desc.Key("W"))
-				}
-				fonts[name] = &f
+				fonts[name] = newFont(font.Key(name))
 			}
 		}
 	}
 
 	return fonts
+}
+
+// newFont builds a Font from its dictionary, populating the CID width table
+// for composite (Type0) fonts so Width lookups work regardless of which code
+// path resolved the font.
+func newFont(fontDict Value) *Font {
+	f := Font{V: fontDict, enc: nil}
+	if fontDict.Key("Subtype").Name() == "Type0" {
+		f.IsCIDFont = true
+		desc := fontDict.Key("DescendantFonts").Index(0)
+		f.DW = desc.Key("DW").Float64()
+		if f.DW == 0 {
+			f.DW = 1000 // the spec's default when DW is absent
+		}
+		f.W = extractWidths(desc.Key("W"))
+	}
+	return &f
 }
 
 // NumPage returns the number of pages in the PDF file.
@@ -1005,14 +1013,26 @@ func (p Page) Content() Content {
 		if g.Tf == nil {
 			return
 		}
-		n := 1
+		// Width lookups are keyed by character code, whose byte size depends
+		// on the font: composite (Type0/CID) fonts consume 2 bytes per code,
+		// simple fonts 1. Walking codes at the wrong stride returns width 0
+		// for every glyph, which collapses all downstream spacing heuristics.
+		step := 1
+		if g.Tf.IsCIDFont {
+			step = 2
+		}
+		n := 0
 		decoded := enc.Decode(s)
 		for _, ch := range decoded {
 			var w0 float64
-			if n < len(s) {
-				w0 = g.Tf.Width(int(s[n]))
+			if n+step <= len(s) {
+				code := int(s[n])
+				if step == 2 {
+					code = code<<8 | int(s[n+1])
+				}
+				w0 = g.Tf.Width(code)
 			}
-			n += 2
+			n += step
 
 			f := g.Tf.BaseFont()
 			if i := strings.Index(f, "+"); i >= 0 {
@@ -1043,8 +1063,7 @@ func (p Page) Content() Content {
 		if fv.Kind() == Null {
 			return nil
 		}
-		f := Font{V: fv}
-		return &f
+		return newFont(fv)
 	}
 
 	// xobjDepth guards against runaway recursion in malformed PDFs where
